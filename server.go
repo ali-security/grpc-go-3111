@@ -108,9 +108,10 @@ type serviceInfo struct {
 }
 
 type serverWorkerData struct {
-	st     transport.ServerTransport
-	wg     *sync.WaitGroup
-	stream *transport.Stream
+	st            transport.ServerTransport
+	wg            *sync.WaitGroup
+	stream        *transport.Stream
+	releaseQuota  func()
 }
 
 // Server is a gRPC server to serve RPC requests.
@@ -534,6 +535,7 @@ func (s *Server) serverWorker(ch chan *serverWorkerData) {
 		if !ok {
 			return
 		}
+		defer data.releaseQuota()
 		s.handleStream(data.st, data.stream, s.traceInfo(data.st, data.stream))
 		data.wg.Done()
 	}
@@ -901,22 +903,32 @@ func (s *Server) serveStreams(st transport.ServerTransport) {
 	defer st.Close()
 	var wg sync.WaitGroup
 
+	streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
 	var roundRobinCounter uint32
 	st.HandleStreams(func(stream *transport.Stream) {
 		wg.Add(1)
+
+		streamQuota.acquire()
 		if s.opts.numServerWorkers > 0 {
-			data := &serverWorkerData{st: st, wg: &wg, stream: stream}
+			data := &serverWorkerData{
+				st: st,
+				wg: &wg,
+				stream: stream,
+				releaseQuota: streamQuota.release,
+			}
 			select {
 			case s.serverWorkerChannels[atomic.AddUint32(&roundRobinCounter, 1)%s.opts.numServerWorkers] <- data:
 			default:
 				// If all stream workers are busy, fallback to the default code path.
 				go func() {
+					defer streamQuota.release()
 					s.handleStream(st, stream, s.traceInfo(st, stream))
 					wg.Done()
 				}()
 			}
 		} else {
 			go func() {
+				defer streamQuota.release()
 				defer wg.Done()
 				s.handleStream(st, stream, s.traceInfo(st, stream))
 			}()
@@ -1864,4 +1876,46 @@ type channelzServer struct {
 
 func (c *channelzServer) ChannelzMetric() *channelz.ServerInternalMetric {
 	return c.s.channelzMetric()
+}
+
+type handlerQuotaKey struct{}
+
+type handlerQuota interface {
+	// acquire is called synchronously
+	acquire()
+	// release may be called asynchronously
+	release()
+}
+
+type atomicHandlerQuota struct {
+	n    atomic.Int64
+	wait chan struct{}
+}
+
+func (q *atomicHandlerQuota) acquire() {
+	if q.n.Add(-1) < 0 {
+		// Block until a release happens.
+		<-q.wait
+	}
+}
+
+func (q *atomicHandlerQuota) release() {
+	if q.n.Add(1) == 0 {
+		// An acquire was waiting on us.  Unblock it.
+		q.wait <- struct{}{}
+	}
+}
+
+type noHandlerQuota struct{}
+
+func (noHandlerQuota) acquire() {}
+func (noHandlerQuota) release() {}
+
+func newHandlerQuota(n uint32) handlerQuota {
+	if n == 0 {
+		return noHandlerQuota{}
+	}
+	a := &atomicHandlerQuota{wait: make(chan struct{}, 1)}
+	a.n.Store(int64(n))
+	return a
 }
