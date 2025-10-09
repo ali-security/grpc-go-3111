@@ -26,14 +26,19 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/internal/grpcsync"
+	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/stubserver"
 
 	testgrpc "google.golang.org/grpc/test/grpc_testing"
 )
 
+type s struct {
+	grpctest.Tester
+}
+
 // TestServer_MaxHandlers ensures that no more than MaxConcurrentStreams server
 // handlers are active at one time.
-func TestServer_MaxHandlers(t *testing.T) {
+func (s) TestServer_MaxHandlers(t *testing.T) {
 	started := make(chan struct{})
 	blockCalls := grpcsync.NewEvent()
 
@@ -51,7 +56,7 @@ func TestServer_MaxHandlers(t *testing.T) {
 	}
 	defer ss.Stop()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	// Start one RPC to the server.
