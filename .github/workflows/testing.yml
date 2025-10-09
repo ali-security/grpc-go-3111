@@ -27,9 +27,6 @@ jobs:
             goversion: 1.17
             testflags: -race
 
-          - type: extras
-            goversion: 1.17
-
           - type: tests
             goversion: 1.17
             goarch: 386
