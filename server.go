@@ -107,13 +107,6 @@ type serviceInfo struct {
 	mdata       interface{}
 }
 
-type serverWorkerData struct {
-	st            transport.ServerTransport
-	wg            *sync.WaitGroup
-	stream        *transport.Stream
-	releaseQuota  func()
-}
-
 // Server is a gRPC server to serve RPC requests.
 type Server struct {
 	opts serverOptions
@@ -138,7 +131,7 @@ type Server struct {
 	channelzID int64 // channelz unique identification number
 	czData     *channelzData
 
-	serverWorkerChannels []chan *serverWorkerData
+	serverWorkerChannels []chan func()
 }
 
 type serverOptions struct {
@@ -169,6 +162,7 @@ type serverOptions struct {
 }
 
 var defaultServerOptions = serverOptions{
+	maxConcurrentStreams:  math.MaxUint32,
 	maxReceiveMessageSize: defaultServerMaxReceiveMessageSize,
 	maxSendMessageSize:    defaultServerMaxSendMessageSize,
 	connectionTimeout:     120 * time.Second,
@@ -362,6 +356,9 @@ func MaxSendMsgSize(m int) ServerOption {
 // MaxConcurrentStreams returns a ServerOption that will apply a limit on the number
 // of concurrent streams to each ServerTransport.
 func MaxConcurrentStreams(n uint32) ServerOption {
+	if n == 0 {
+		n = math.MaxUint32
+	}
 	return newFuncServerOption(func(o *serverOptions) {
 		o.maxConcurrentStreams = n
 	})
@@ -526,18 +523,16 @@ const serverWorkerResetThreshold = 1 << 16
 // re-allocations (see the runtime.morestack problem [1]).
 //
 // [1] https://github.com/golang/go/issues/18138
-func (s *Server) serverWorker(ch chan *serverWorkerData) {
+func (s *Server) serverWorker(ch chan func()) {
 	// To make sure all server workers don't reset at the same time, choose a
 	// random number of iterations before resetting.
 	threshold := serverWorkerResetThreshold + grpcrand.Intn(serverWorkerResetThreshold)
 	for completed := 0; completed < threshold; completed++ {
-		data, ok := <-ch
+		f, ok := <-ch
 		if !ok {
 			return
 		}
-		defer data.releaseQuota()
-		s.handleStream(data.st, data.stream, s.traceInfo(data.st, data.stream))
-		data.wg.Done()
+		f()
 	}
 	go s.serverWorker(ch)
 }
@@ -545,9 +540,9 @@ func (s *Server) serverWorker(ch chan *serverWorkerData) {
 // initServerWorkers creates worker goroutines and channels to process incoming
 // connections to reduce the time spent overall on runtime.morestack.
 func (s *Server) initServerWorkers() {
-	s.serverWorkerChannels = make([]chan *serverWorkerData, s.opts.numServerWorkers)
+	s.serverWorkerChannels = make([]chan func(), s.opts.numServerWorkers)
 	for i := uint32(0); i < s.opts.numServerWorkers; i++ {
-		s.serverWorkerChannels[i] = make(chan *serverWorkerData)
+		s.serverWorkerChannels[i] = make(chan func())
 		go s.serverWorker(s.serverWorkerChannels[i])
 	}
 }
@@ -909,29 +904,20 @@ func (s *Server) serveStreams(st transport.ServerTransport) {
 		wg.Add(1)
 
 		streamQuota.acquire()
+		f := func() {
+			defer streamQuota.release()
+			defer wg.Done()
+			s.handleStream(st, stream, s.traceInfo(st, stream))
+		}
 		if s.opts.numServerWorkers > 0 {
-			data := &serverWorkerData{
-				st: st,
-				wg: &wg,
-				stream: stream,
-				releaseQuota: streamQuota.release,
-			}
 			select {
-			case s.serverWorkerChannels[atomic.AddUint32(&roundRobinCounter, 1)%s.opts.numServerWorkers] <- data:
+			case s.serverWorkerChannels[atomic.AddUint32(&roundRobinCounter, 1)%s.opts.numServerWorkers] <- f:
 			default:
 				// If all stream workers are busy, fallback to the default code path.
-				go func() {
-					defer streamQuota.release()
-					s.handleStream(st, stream, s.traceInfo(st, stream))
-					wg.Done()
-				}()
+				go f()
 			}
 		} else {
-			go func() {
-				defer streamQuota.release()
-				defer wg.Done()
-				s.handleStream(st, stream, s.traceInfo(st, stream))
-			}()
+			go f()
 		}
 	}, func(ctx context.Context, method string) context.Context {
 		if !EnableTracing {
@@ -1888,19 +1874,19 @@ type handlerQuota interface {
 }
 
 type atomicHandlerQuota struct {
-	n    atomic.Int64
+	n    int64
 	wait chan struct{}
 }
 
 func (q *atomicHandlerQuota) acquire() {
-	if q.n.Add(-1) < 0 {
+	if atomic.AddInt64(&q.n, -1) < 0 {
 		// Block until a release happens.
 		<-q.wait
 	}
 }
 
 func (q *atomicHandlerQuota) release() {
-	if q.n.Add(1) == 0 {
+	if atomic.AddInt64(&q.n, 1) <= 0 {
 		// An acquire was waiting on us.  Unblock it.
 		q.wait <- struct{}{}
 	}
@@ -1912,10 +1898,7 @@ func (noHandlerQuota) acquire() {}
 func (noHandlerQuota) release() {}
 
 func newHandlerQuota(n uint32) handlerQuota {
-	if n == 0 {
-		return noHandlerQuota{}
-	}
 	a := &atomicHandlerQuota{wait: make(chan struct{}, 1)}
-	a.n.Store(int64(n))
+	atomic.StoreInt64(&a.n, int64(n))
 	return a
 }
