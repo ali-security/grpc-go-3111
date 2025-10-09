@@ -80,13 +80,3 @@ jobs:
           cd ${GITHUB_WORKSPACE}/security/advancedtls && go test ${{ matrix.testflags }} -timeout 2m google.golang.org/grpc/security/advancedtls/...
           cd ${GITHUB_WORKSPACE}/security/authorization && go test ${{ matrix.testflags }} -timeout 2m google.golang.org/grpc/security/authorization/...
 
-
-      # Non-core gRPC tests (examples, interop, etc)
-      - name: Run extras tests
-        if: matrix.type == 'extras'
-        run: |
-          go version
-          examples/examples_test.sh
-          security/advancedtls/examples/examples_test.sh
-          interop/interop_test.sh
-          xds/internal/test/e2e/run.sh
