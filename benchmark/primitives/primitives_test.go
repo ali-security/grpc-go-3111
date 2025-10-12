@@ -434,8 +434,31 @@ type alwaysNop struct{}
 
 func (alwaysNop) nop() {}
 
+type noCopy struct{}
+
+// Lock is a no-op used by -copylocks checker from `go vet`.
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}
+
+type Bool struct {
+	_ noCopy
+	v uint32
+}
+
+// Load atomically loads and returns the value stored in x.
+func (x *Bool) Load() bool { return atomic.LoadUint32(&x.v) != 0 }
+
+// Store atomically stores val into x.
+func (x *Bool) Store(val bool) {
+	if val {
+		atomic.StoreUint32(&x.v, 1)
+	}
+
+	atomic.StoreUint32(&x.v, 0)
+}
+
 type concreteNop struct {
-	isNop atomic.Bool
+	isNop Bool
 	i     int
 }
 
